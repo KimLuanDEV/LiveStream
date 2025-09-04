@@ -22,9 +22,30 @@
     </label>
   </div>
   <video id="player" playsinline autoplay controls></video>
+  <div style="margin:8px 0;">
+    <button id="btnUnmute" style="display:none;padding:8px 12px;border:0;border-radius:10px;background:#2ecc71;font-weight:600;cursor:pointer">🔊 Bật tiếng</button>
+  </div>
+
 
   <script>
     const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host);
+
+    const v = document.getElementById("player");
+    const btnUnmute = document.getElementById("btnUnmute");
+    function tryPlayWithUnlock() {
+      if (!v) return;
+      v.muted = false;
+      v.play().then(() => {
+        btnUnmute.style.display = "none";
+        console.log("video.play() ok (unmuted)");
+      }).catch(err => {
+        console.warn("video.play() blocked:", err);
+        // show unlock button
+        btnUnmute.style.display = "inline-block";
+      });
+    }
+    btnUnmute?.addEventListener("click", tryPlayWithUnlock);
+
 
     // Load ICE dynamically from /ice (Twilio) + ưu tiên 443
     let iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
@@ -92,11 +113,31 @@
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
 
+      
       pc.ontrack = (e) => {
         const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
-        $("#player").srcObject = stream;
-        $("#player").play().catch(()=>{});
+        const v = document.getElementById("player");
+        v.srcObject = stream;
+        v.playsInline = true;
+        v.autoplay = true;
+        v.muted = false;
+        v.play().then(() => console.log("video.play() ok")).catch(err => console.warn("video.play() blocked:", err));
+        // Inbound stats after 2s
+        setTimeout(async () => {
+          try {
+            const stats = await pc.getStats();
+            stats.forEach(r => {
+              if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
+                console.log("inbound video frames/bytes:", r.framesDecoded, r.bytesReceived);
+              }
+              if (r.type === "inbound-rtp" && (r.kind === "audio" || r.mediaType === "audio")) {
+                console.log("inbound audio packets/bytes:", r.packetsReceived, r.bytesReceived);
+              }
+            });
+          } catch {}
+        }, 2000);
       };
+
 
       return pc;
     }

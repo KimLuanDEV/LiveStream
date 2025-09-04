@@ -112,35 +112,57 @@
       }
     }
 
-    const WS_URL = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host;
-    let ws, wsOpen = false;
+    
+        const WS_SCHEME = (location.protocol === 'https:' ? 'wss' : 'ws');
+    const WS_ORIGIN = WS_SCHEME + '://' + location.host;
+    let ws = null;
+    let wsOpen = false;
+    let wsReconnectDelay = 500; // ms
+    const WS_RECONNECT_MAX = 8000;
 
     function setupWS() {
-      ws = new WebSocket(WS_URL);
+      tryConnectWS();
+    }
+
+    function tryConnectWS() {
+      const url = WS_ORIGIN;
+      ws = new WebSocket(url);
       ws.addEventListener("open", () => {
         wsOpen = true;
-        $("#status").textContent = "WS connected. Sẵn sàng phát.";
-        $("#btnStart").disabled = false;
-        $("#btnStartNoAudio").disabled = false;
-        log("WebSocket: connected", "ok");
-        listDevicesAndFill();
+        wsReconnectDelay = 500;
+        log("WebSocket connected: " + url, "ok");
+        const statusEl = document.getElementById("status");
+        if (statusEl) statusEl.textContent = "WS connected.";
+        // enable UI if broadcaster
+        if (true) {
+          document.getElementById("btnStart").disabled = false;
+          document.getElementById("btnStartNoAudio").disabled = false;
+          listDevicesAndFill();
+        }
       });
-      ws.addEventListener("close", () => {
+      ws.addEventListener("close", (ev) => {
         wsOpen = false;
-        $("#status").textContent = "WS disconnected";
-        $("#btnStart").disabled = true;
-        $("#btnStartNoAudio").disabled = true;
-        $("#btnFlip").disabled = true;
-        log("WebSocket: closed", "warn");
+        log("WebSocket closed (" + ev.code + "): " + (ev.reason || "no reason"), "warn");
+        const statusEl = document.getElementById("status");
+        if (statusEl) statusEl.textContent = "WS disconnected (" + ev.code + "). Reconnecting…";
+        // disable UI if broadcaster
+        if (true) {
+          document.getElementById("btnStart").disabled = true;
+          document.getElementById("btnStartNoAudio").disabled = true;
+          document.getElementById("btnFlip").disabled = true;
+        }
+        setTimeout(tryConnectWS, wsReconnectDelay);
+        wsReconnectDelay = Math.min(WS_RECONNECT_MAX, Math.floor(wsReconnectDelay * 1.7));
       });
-      ws.addEventListener("error", () => {
-        log("WebSocket error (kiểm tra Render/proxy).", "err");
+      ws.addEventListener("error", (e) => {
+        log("WebSocket error (proxy/SSL?): " + (e.message || e), "err");
+        ws.close();
       });
       ws.addEventListener("message", async (ev) => {
         const msg = JSON.parse(ev.data);
-        if (msg.type === "ack" && msg.role === "broadcaster") {
+                if (msg.type === "ack" && msg.role === "broadcaster") {
           log("Server ACK: broadcaster sẵn sàng.", "ok");
-          $("#status").textContent = "Đang phát… chờ viewer";
+          document.getElementById("status").textContent = "Đang phát… chờ viewer";
         }
         if (msg.type === "viewer-join") {
           log(`Viewer join: ${msg.viewerId}`);
@@ -168,11 +190,13 @@
           log("Server yêu cầu dừng phát.", "warn");
           stopStream();
         }
+    
       });
     }
-    setupWS();
+    
 
-    const peers = new Map();
+const peers = new Map();
+setupWS();
     let localStream = null;
     let isStreaming = false;
     let desiredFacing = "user";
@@ -234,7 +258,9 @@
         trials.push({ video: camId ? { deviceId: { exact: camId } } : true, audio: withAudio ? (micId ? { deviceId: { exact: micId } } : true) : false });
       }
       trials.push({ video: { facingMode: desiredFacing }, audio: withAudio });
-      trials.push({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: withAudio });
+      const isCellular = navigator.connection && /cellular/i.test(navigator.connection.type || navigator.connection.effectiveType || "");
+      const baseVideo = isCellular ? { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 24, max: 30 } } : { width: { ideal: 1280 }, height: { ideal: 720 } };
+      trials.push({ video: baseVideo, audio: withAudio });
       trials.push({ video: true, audio: withAudio });
       trials.push({ video: true, audio: false });
 
@@ -302,11 +328,58 @@
 
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
+      // === GIỚI HẠN BITRATE / ƯU TIÊN MOBILE ===
+      try {
+        const isCell = navigator.connection && /cellular/i.test(navigator.connection.type || navigator.connection.effectiveType || "");
+        const senders = pc.getSenders ? pc.getSenders() : [];
+        const vsender = senders.find(s => s.track && s.track.kind === "video");
+        if (vsender?.getParameters) {
+          const p = vsender.getParameters();
+          p.degradationPreference = "balanced";
+          const maxKbps = isCell ? 800 : 1500;
+          p.encodings = p.encodings && p.encodings.length ? p.encodings : [{}];
+          p.encodings[0].maxBitrate = maxKbps * 1000;
+          await vsender.setParameters(p);
+          if (vsender.track) vsender.track.contentHint = "motion";
+          console.log("Video max bitrate:", maxKbps, "kbps");
+        }
+      } catch (e) { console.warn("setParameters fail:", e); }
+
+
       pc.onicecandidate = (e) => {
         if (e.candidate) {
           ws.send(JSON.stringify({ type: "ice-candidate", from:"broadcaster", viewerId, candidate: e.candidate }));
         }
       };
+
+
+      // === ƯU TIÊN CODEC: H.264 (video), Opus (audio) ===
+      try {
+        if (pc.getTransceivers) {
+          const txv = pc.getTransceivers().find(t => t.sender?.track?.kind === "video");
+          if (txv?.setCodecPreferences && window.RTCRtpSender?.getCapabilities) {
+            const capsV = RTCRtpSender.getCapabilities("video");
+            if (capsV?.codecs?.length) {
+              const h264 = capsV.codecs.filter(c => /H264/i.test(c.mimeType));
+              const others = capsV.codecs.filter(c => !/H264/i.test(c.mimeType));
+              const prefsV = [...h264, ...others];
+              txv.setCodecPreferences(prefsV);
+              console.log("Codec prefs (video):", prefsV.map(c => c.mimeType));
+            }
+          }
+          const txa = pc.getTransceivers().find(t => t.sender?.track?.kind === "audio");
+          if (txa?.setCodecPreferences && window.RTCRtpSender?.getCapabilities) {
+            const capsA = RTCRtpSender.getCapabilities("audio");
+            if (capsA?.codecs?.length) {
+              const opus = capsA.codecs.filter(c => /opus/i.test(c.mimeType));
+              const othersA = capsA.codecs.filter(c => !/opus/i.test(c.mimeType));
+              const prefsA = [...opus, ...othersA];
+              txa.setCodecPreferences(prefsA);
+              console.log("Codec prefs (audio):", prefsA.map(c => c.mimeType));
+            }
+          }
+        }
+      } catch (e) { console.warn("setCodecPreferences fail:", e); }
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
