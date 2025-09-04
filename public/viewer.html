@@ -64,7 +64,7 @@
       }
     }
 
-    const $ = id => document.getElementById(id);
+    const $ = (sel) => sel && sel.startsWith("#") ? document.querySelector(sel) : document.getElementById(sel);
 
     let pc = null;
     let viewerId = null;

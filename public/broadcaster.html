@@ -55,7 +55,7 @@
   <div id="logs"></div>
 
   <script>
-    const $ = (id) => document.getElementById(id);
+    const $ = (sel) => sel && sel.startsWith("#") ? document.querySelector(sel) : document.getElementById(sel);
     function log(msg, cls="") {
       const d = new Date().toLocaleTimeString();
       const el = document.createElement("div");
