@@ -14,10 +14,12 @@
     .stop { background:#e74c3c; }
     .muted { background:#8e44ad; }
     .tag { background:#17203a; padding:6px 10px; border-radius:8px; font-size:12px; }
-    #logs { background:#0e1730; border:1px solid #233056; border-radius:10px; padding:10px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; max-height:200px; overflow:auto; }
+    #logs { background:#0e1730; border:1px solid #233056; border-radius:10px; padding:10px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; max-height:220px; overflow:auto; }
     .warn { color:#f7d774 }
-    .err { color:#ff8a8a }
-    .ok { color:#8ff0a4 }
+    .err  { color:#ff8a8a }
+    .ok   { color:#8ff0a4 }
+    label { display:flex; align-items:center; gap:8px; }
+    select{ padding:6px 8px; border-radius:8px; background:#0e1730; color:#e6f0ff; border:1px solid #233056; }
   </style>
 </head>
 <body>
@@ -31,9 +33,17 @@
     <span id="status" class="tag">Đang khởi tạo…</span>
   </div>
 
-  <p>
+  <div class="row" style="margin-top:10px">
+    <label>Camera:
+      <select id="selCam"></select>
+    </label>
+    <label>Mic:
+      <select id="selMic"></select>
+    </label>
     <span id="secureHint" class="tag"></span>
-  </p>
+  </div>
+
+  <p style="margin:8px 0 0">Mẹo: Trên điện thoại, nếu muốn mở mặc định **camera sau**, bấm “Đổi camera” sau khi bắt đầu phát, hoặc đổi từ menu Camera trước khi phát.</p>
 
   <video id="preview" playsinline autoplay muted></video>
 
@@ -41,7 +51,7 @@
   <div id="logs"></div>
 
   <script>
-    // ====== Helpers ======
+    // ========== Helpers ==========
     const $ = (id) => document.getElementById(id);
     function log(msg, cls="") {
       const d = new Date().toLocaleTimeString();
@@ -53,31 +63,15 @@
       console.log(msg);
     }
 
-    // ====== Secure context hint (HTTPS/localhost) ======
-    const isSecure = location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    // Secure-context hint
+    const isSecure = location.protocol === "https:" || ["localhost","127.0.0.1"].includes(location.hostname);
     $("secureHint").textContent = isSecure
-      ? "✅ Secure context OK (HTTPS/localhost)"
-      : "⚠️ Cần chạy HTTPS hoặc localhost để camera/mic hoạt động";
+      ? "✅ HTTPS/localhost: OK"
+      : "⚠️ Cần HTTPS để camera/mic hoạt động ổn định";
 
-    // ====== WS setup ======
+    // ========== WebSocket ==========
     const WS_URL = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host;
-    let ws;
-    let wsOpen = false;
-    let desiredFacing = "user";         // "user" (trước) | "environment" (sau)
-    let currentCamDeviceId = null;      // deviceId camera đang dùng (nếu biết)
- 
-function makeVideoConstraints({ facing, deviceId }) {
-  // Ưu tiên deviceId nếu có; nếu không, dùng facingMode (hợp di động)
-  if (deviceId) {
-    return { video: { deviceId: { exact: deviceId } } };
-  }
-  if (facing) {
-    return { video: { facingMode: { exact: facing } } };
-  }
-  // fallback mềm 720p
-  return { video: { width: { ideal: 1280 }, height: { ideal: 720 } } };
-}
-
+    let ws, wsOpen = false;
 
     function setupWS() {
       ws = new WebSocket(WS_URL);
@@ -88,18 +82,20 @@ function makeVideoConstraints({ facing, deviceId }) {
         $("btnStart").disabled = false;
         $("btnStartNoAudio").disabled = false;
         log("WebSocket: connected", "ok");
+        listDevicesAndFill(); // sau khi có thể xin quyền
       });
 
-      ws.addEventListener("close", (e) => {
+      ws.addEventListener("close", () => {
         wsOpen = false;
         $("status").textContent = "WS disconnected";
         $("btnStart").disabled = true;
         $("btnStartNoAudio").disabled = true;
+        $("btnFlip").disabled = true;
         log("WebSocket: closed", "warn");
       });
 
-      ws.addEventListener("error", (e) => {
-        log("WebSocket error (kiểm tra cổng/Render/Vercel hỗ trợ WS).", "err");
+      ws.addEventListener("error", () => {
+        log("WebSocket error (kiểm tra Render/proxy).", "err");
       });
 
       ws.addEventListener("message", async (ev) => {
@@ -132,81 +128,144 @@ function makeVideoConstraints({ facing, deviceId }) {
 
         if (msg.type === "viewer-left") {
           const pc = peers.get(msg.viewerId);
-          if (pc) {
-            pc.close();
-            peers.delete(msg.viewerId);
-            log(`Viewer rời: ${msg.viewerId}`, "warn");
-          }
+          if (pc) { pc.close(); peers.delete(msg.viewerId); }
+          log(`Viewer rời: ${msg.viewerId}`, "warn");
         }
 
         if (msg.type === "end") {
-          log("Server yêu cầu dừng phát (broadcaster cũ ngắt).", "warn");
+          log("Server yêu cầu dừng phát.", "warn");
           stopStream();
         }
       });
     }
-
-    // Gọi ngay
     setupWS();
 
-    // ====== WebRTC ======
+    // ========== Media & WebRTC ==========
     const peers = new Map(); // viewerId -> RTCPeerConnection
     let localStream = null;
     let isStreaming = false;
+    let desiredFacing = "user";     // user|environment
+    let currentCamDeviceId = null;
+
     const iceServers = [
       { urls: "stun:stun.l.google.com:19302" },
-      // Nếu cần xuyên NAT tốt hơn, thêm TURN ở đây:
-      // { urls: "turn:your.turn.server:3478", username: "user", credential: "pass" }
+      // Thêm TURN nếu cần NAT khó:
+      // { urls: "turn:YOUR_TURN:3478", username:"USER", credential:"PASS" }
     ];
+
+    function makeVideoConstraints({ facing, deviceId }) {
+      if (deviceId) return { video: { deviceId: { exact: deviceId } } };
+      if (facing) return { video: { facingMode: { exact: facing } } };
+      return { video: { width: { ideal: 1280 }, height: { ideal: 720 } } };
+    }
 
     async function ensureWSReady() {
       if (wsOpen) return true;
-      for (let i=0;i<30;i++) { // đợi tối đa ~3s
-        await new Promise(r => setTimeout(r, 100));
-        if (wsOpen) return true;
-      }
+      for (let i=0;i<30;i++) { await new Promise(r => setTimeout(r, 100)); if (wsOpen) return true; }
       log("WS chưa sẵn sàng. Không thể phát.", "err");
       return false;
     }
 
+    async function listDevicesAndFill() {
+      try {
+        // kích hoạt quyền trước để hiện label
+        try {
+          const tmp = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+          tmp.getTracks().forEach(t => t.stop());
+        } catch(e) { /* user có thể từ chối lần đầu; vẫn enumerate được 1 phần */ }
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === "videoinput");
+        const mics = devices.filter(d => d.kind === "audioinput");
+
+        const selCam = $("selCam"), selMic = $("selMic");
+        selCam.innerHTML = ""; selMic.innerHTML = "";
+
+        cams.forEach((d, i) => {
+          const opt = document.createElement("option");
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Camera ${i+1}`;
+          selCam.appendChild(opt);
+        });
+        mics.forEach((d, i) => {
+          const opt = document.createElement("option");
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Mic ${i+1}`;
+          selMic.appendChild(opt);
+        });
+
+        log(`Thiết bị: ${cams.length} camera, ${mics.length} mic.`, "ok");
+      } catch (e) {
+        log("enumerateDevices lỗi: " + e.message, "err");
+      }
+    }
+
     async function startStream(withAudio = true) {
-      // 1) Kiểm tra WS
       const ok = await ensureWSReady();
       if (!ok) return;
 
-      // 2) Xin thiết bị
-      try {
-        const constraints = { video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: withAudio };
-        localStream = await navigator.mediaDevices.getUserMedia(constraints);
-        $("preview").srcObject = localStream;
-        log("Đã lấy camera/mic.", "ok");
-      } catch (e) {
-        log("Không truy cập được camera/mic: " + e.message, "err");
-        $("status").textContent = "Từ chối camera/mic hoặc lỗi thiết bị.";
+      const selCam = $("selCam"), selMic = $("selMic");
+      const camId = selCam && selCam.value ? selCam.value : undefined;
+      const micId = selMic && selMic.value ? selMic.value : undefined;
+
+      const trialConstraints = [];
+      // ưu tiên deviceId nếu đã chọn
+      if (camId || (withAudio && micId)) {
+        trialConstraints.push({
+          video: camId ? { deviceId: { exact: camId } } : true,
+          audio: withAudio ? (micId ? { deviceId: { exact: micId } } : true) : false
+        });
+      }
+      // facingMode (mobile)
+      trialConstraints.push({
+        video: { facingMode: desiredFacing },
+        audio: withAudio
+      });
+      // 720p mềm
+      trialConstraints.push({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: withAudio
+      });
+      // rất rộng
+      trialConstraints.push({ video: true, audio: withAudio });
+      // video-only fallback
+      trialConstraints.push({ video: true, audio: false });
+
+      let stream = null, lastErr = null;
+      for (const c of trialConstraints) {
+        try {
+          log("Thử constraints: " + JSON.stringify(c));
+          stream = await navigator.mediaDevices.getUserMedia(c);
+          if (stream) break;
+        } catch (e) { lastErr = e; }
+      }
+      if (!stream) {
+        log("Không truy cập được camera/mic: " + (lastErr ? (lastErr.name + ": " + lastErr.message) : ""), "err");
+        $("status").textContent = "Không truy cập được camera/mic.";
         return;
       }
 
-      // 3) Báo server: broadcaster sẵn sàng
-      try {
-        ws.send(JSON.stringify({ type: "broadcaster-ready" }));
-      } catch (e) {
-        log("Gửi broadcaster-ready thất bại: " + e.message, "err");
-        return;
-      }
+      localStream = stream;
+      $("preview").srcObject = localStream;
+
+      // cập nhật deviceId hiện tại (nếu có)
+      const vtrack = localStream.getVideoTracks()[0];
+      currentCamDeviceId = vtrack?.getSettings?.().deviceId || camId || null;
+
+      try { ws.send(JSON.stringify({ type: "broadcaster-ready" })); }
+      catch (e) { log("Gửi broadcaster-ready thất bại: " + e.message, "err"); return; }
 
       isStreaming = true;
-      $("btnFlip").disabled = false;
       $("btnStart").disabled = true;
       $("btnStartNoAudio").disabled = true;
       $("btnStop").disabled = false;
+      $("btnFlip").disabled = false;
       $("status").textContent = "Đang phát… mời viewer mở viewer.html";
+      log("Đã bắt đầu phát.", "ok");
     }
 
     async function createOfferForViewer(viewerId) {
-      if (!localStream) {
-        log("Chưa có localStream khi viewer join.", "err");
-        return;
-      }
+      if (!localStream) { log("Chưa có localStream khi viewer join.", "err"); return; }
       const pc = new RTCPeerConnection({ iceServers });
       peers.set(viewerId, pc);
 
@@ -215,25 +274,16 @@ function makeVideoConstraints({ facing, deviceId }) {
       pc.onicecandidate = (e) => {
         if (e.candidate) {
           ws.send(JSON.stringify({
-            type: "ice-candidate",
-            from: "broadcaster",
-            viewerId,
-            candidate: e.candidate
+            type: "ice-candidate", from:"broadcaster",
+            viewerId, candidate: e.candidate
           }));
         }
       };
-      pc.onconnectionstatechange = () => {
-        log(`Peer ${viewerId} state: ${pc.connectionState}`);
-      };
+      pc.onconnectionstatechange = () => { /* log(`Peer ${viewerId}: ${pc.connectionState}`); */ };
 
-      const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
+      const offer = await pc.createOffer(); // KHÔNG truyền offerToReceive*
       await pc.setLocalDescription(offer);
-
-      ws.send(JSON.stringify({
-        type: "offer",
-        viewerId,
-        sdp: pc.localDescription
-      }));
+      ws.send(JSON.stringify({ type:"offer", viewerId, sdp: pc.localDescription }));
       log(`Đã gửi offer cho viewer ${viewerId}`, "ok");
     }
 
@@ -244,113 +294,77 @@ function makeVideoConstraints({ facing, deviceId }) {
       if (localStream) localStream.getTracks().forEach(t => t.stop());
       localStream = null;
       isStreaming = false;
-      $("btnFlip").disabled = true;
       $("preview").srcObject = null;
-      $("btnStart").disabled = !wsOpen ? true : false;
-      $("btnStartNoAudio").disabled = !wsOpen ? true : false;
+      $("btnStart").disabled = !wsOpen;
+      $("btnStartNoAudio").disabled = !wsOpen;
       $("btnStop").disabled = true;
+      $("btnFlip").disabled = true;
       $("status").textContent = "Đã dừng phát";
-      log("Đã dừng phát và đóng mọi peer.");
+      log("Đã dừng phát & đóng peers.");
+    }
+
+    async function getCameras() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices.filter(d => d.kind === "videoinput");
+    }
+
+    async function switchCamera() {
+      if (!isStreaming) { log("Bấm Bắt đầu phát trước khi đổi camera.", "warn"); return; }
+      try {
+        const nextFacing = desiredFacing === "user" ? "environment" : "user";
+        let targetDeviceId = null;
+        try {
+          const cams = await getCameras();
+          const guess = cams.find(c =>
+            (nextFacing === "environment")
+              ? /back|rear|environment|sau|ngoài/i.test(c.label)
+              : /front|user|trước|trong/i.test(c.label)
+          );
+          if (guess) targetDeviceId = guess.deviceId;
+        } catch {}
+
+        const constraints = makeVideoConstraints({ facing: nextFacing, deviceId: targetDeviceId });
+        const newStream = await navigator.mediaDevices.getUserMedia({ ...constraints, audio:false });
+        const newTrack = newStream.getVideoTracks()[0];
+        if (!newTrack) throw new Error("Không lấy được video track mới.");
+
+        // local preview
+        const oldVideoTracks = localStream.getVideoTracks();
+        oldVideoTracks.forEach(t => t.stop());
+        oldVideoTracks.forEach(t => localStream.removeTrack?.(t));
+        localStream.addTrack(newTrack);
+        $("preview").srcObject = null;
+        $("preview").srcObject = localStream;
+
+        // thay track trên tất cả peer
+        for (const [, pc] of peers) {
+          const senders = pc.getSenders().filter(s => s.track && s.track.kind === "video");
+          if (senders.length) {
+            await Promise.all(senders.map(s => s.replaceTrack(newTrack)));
+          } else {
+            pc.addTrack(newTrack, localStream);
+          }
+        }
+
+        desiredFacing = nextFacing;
+        const settings = newTrack.getSettings?.();
+        currentCamDeviceId = settings?.deviceId || targetDeviceId || null;
+
+        log(`Đã đổi camera sang: ${desiredFacing}${currentCamDeviceId ? " ("+currentCamDeviceId+")" : ""}`, "ok");
+      } catch (e) {
+        log("Đổi camera thất bại: " + e.message, "err");
+      }
     }
 
     $("btnStart").onclick = () => startStream(true);
     $("btnStartNoAudio").onclick = () => startStream(false);
-    $("btnStop").onclick = stopStream;
+    $("btnStop").onclick  = stopStream;
+    $("btnFlip").onclick  = switchCamera;
 
-    // ====== Extra: kiểm tra thiết bị sẵn có (gợi ý debug) ======
-    (async () => {
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const cams = devices.filter(d => d.kind === "videoinput").length;
-        const mics = devices.filter(d => d.kind === "audioinput").length;
-        log(`Thiết bị: ${cams} camera, ${mics} mic.`);
-      } catch {}
-    })();
-
-
-async function getCameras() {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  return devices.filter(d => d.kind === "videoinput");
-}
-
-async function switchCamera() {
-  if (!isStreaming) {
-    log("Chưa phát. Hãy bấm Bắt đầu phát trước khi đổi camera.", "warn");
-    return;
-  }
-
-  try {
-    // 1) Quyết định facing tiếp theo
-    const nextFacing = desiredFacing === "user" ? "environment" : "user";
-
-    // 2) Thử map deviceId theo facing (nếu có nhiều camera)
-    let targetDeviceId = null;
-    try {
-      const cams = await getCameras();
-      // cố gắng match theo label (sau khi cấp quyền, label sẽ có chữ 'back'/'rear'/'front' hoặc nội địa)
-      const guess = cams.find(c =>
-        (nextFacing === "environment")
-          ? /back|rear|environment|sau|ngoài/i.test(c.label)
-          : /front|user|trước|trong/i.test(c.label)
-      );
-      if (guess) targetDeviceId = guess.deviceId;
-    } catch { /* ignore */ }
-
-    // 3) Xin track video mới theo deviceId (nếu có) hoặc facingMode
-    const constraints = makeVideoConstraints({ facing: nextFacing, deviceId: targetDeviceId });
-    const newStream = await navigator.mediaDevices.getUserMedia({
-      ...constraints,
-      audio: false // chỉ cần video track mới; audio giữ nguyên
+    document.addEventListener("DOMContentLoaded", () => {
+      // nếu WS đã mở thì liệt kê thiết bị; nếu chưa, listDevicesAndFill sẽ gọi sau khi WS open
+      if (wsOpen) listDevicesAndFill();
     });
-    const newVideoTrack = newStream.getVideoTracks()[0];
-    if (!newVideoTrack) throw new Error("Không lấy được video track mới.");
-
-    // 4) Gắn vào local preview
-    // Hạ track cũ
-    const oldVideoTracks = localStream.getVideoTracks();
-    oldVideoTracks.forEach(t => t.stop());
-    // Remove cũ khỏi localStream (nếu trình duyệt cần)
-    oldVideoTracks.forEach(t => localStream.removeTrack?.(t));
-
-    // Thêm track mới vào localStream
-    localStream.addTrack(newVideoTrack);
-    // Cập nhật srcObject (đảm bảo video đang chạy)
-    $("preview").srcObject = null;
-    $("preview").srcObject = localStream;
-
-    // 5) Thay track trong tất cả peer sender (không renegotiate)
-    for (const [, pc] of peers) {
-      const senders = pc.getSenders().filter(s => s.track && s.track.kind === "video");
-      if (senders.length) {
-        await Promise.all(senders.map(s => s.replaceTrack(newVideoTrack)));
-      } else {
-        // fallback hiếm: chưa có sender video → addTrack
-        pc.addTrack(newVideoTrack, localStream);
-      }
-    }
-
-    // 6) Cập nhật trạng thái & log
-    desiredFacing = nextFacing;
-    // Thử đọc lại deviceId đang chạy
-    const settings = newVideoTrack.getSettings?.();
-    currentCamDeviceId = settings?.deviceId || targetDeviceId || null;
-
-    log(`Đã đổi camera sang: ${desiredFacing}${currentCamDeviceId ? " ("+currentCamDeviceId+")" : ""}`, "ok");
-  } catch (e) {
-    log("Đổi camera thất bại: " + e.message, "err");
-  }
-}
-
-$("btnFlip").onclick = switchCamera;
-
-
-const baseConstraints = makeVideoConstraints({ facing: desiredFacing, deviceId: currentCamDeviceId });
-const constraints = {
-  ...baseConstraints,
-  audio: withAudio
-};
-localStream = await navigator.mediaDevices.getUserMedia(constraints);
-
   </script>
 </body>
 </html>

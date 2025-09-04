@@ -27,9 +27,24 @@
     let pc = null;
     let viewerId = null;
 
-    ws.addEventListener("open", () => {
-      $("status").textContent = "WS connected. Nhấn 'Xem livestream'.";
-    });
+    function ensurePC() {
+      if (pc) return pc;
+      pc = new RTCPeerConnection({ iceServers });
+
+      // Nhận video & audio chủ động (fix iOS/some browsers chỉ nghe tiếng)
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+
+      pc.ontrack = (e) => {
+        const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+        $("player").srcObject = stream;
+        $("player").play().catch(()=>{});
+      };
+
+      return pc;
+    }
+
+    ws.addEventListener("open", () => { $("status").textContent = "WS connected. Nhấn 'Xem livestream'."; });
 
     ws.addEventListener("message", async (ev) => {
       const msg = JSON.parse(ev.data);
@@ -40,23 +55,7 @@
       }
 
       if (msg.type === "offer" && msg.viewerId === viewerId) {
-        // tạo pc nếu chưa
-        if (!pc) {
-          pc = new RTCPeerConnection({ iceServers });
-          pc.ontrack = (e) => {
-            $("player").srcObject = e.streams[0];
-          };
-          pc.onicecandidate = (e) => {
-            if (e.candidate) {
-              ws.send(JSON.stringify({
-                type: "ice-candidate",
-                from: "viewer",
-                viewerId,
-                candidate: e.candidate
-              }));
-            }
-          };
-        }
+        const pc = ensurePC();
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -78,6 +77,7 @@
     $("btnWatch").onclick = () => {
       ws.send(JSON.stringify({ type: "viewer-join" }));
       $("status").textContent = "Đang kết nối…";
+      ensurePC();
     };
   </script>
 </body>
