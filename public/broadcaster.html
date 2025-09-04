@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="vi">
 <head>
@@ -43,7 +44,7 @@
     <span id="secureHint" class="tag"></span>
   </div>
 
-  <p style="margin:8px 0 0">Mẹo: Trên điện thoại, nếu muốn mở mặc định **camera sau**, bấm “Đổi camera” sau khi bắt đầu phát, hoặc đổi từ menu Camera trước khi phát.</p>
+  <p style="margin:8px 0 0">Mẹo: Trên điện thoại, nếu muốn mở mặc định <b>camera sau</b>, bấm “Đổi camera” sau khi bắt đầu phát, hoặc chọn camera từ menu trước khi phát.</p>
 
   <video id="preview" playsinline autoplay muted></video>
 
@@ -51,7 +52,6 @@
   <div id="logs"></div>
 
   <script>
-    // ========== Helpers ==========
     const $ = (id) => document.getElementById(id);
     function log(msg, cls="") {
       const d = new Date().toLocaleTimeString();
@@ -63,28 +63,41 @@
       console.log(msg);
     }
 
-    // Secure-context hint
     const isSecure = location.protocol === "https:" || ["localhost","127.0.0.1"].includes(location.hostname);
     $("secureHint").textContent = isSecure
       ? "✅ HTTPS/localhost: OK"
       : "⚠️ Cần HTTPS để camera/mic hoạt động ổn định";
 
-    // ========== WebSocket ==========
+    // ===== Load ICE from /ice (Twilio) =====
+    let iceServers = [{ urls: "stun:stun.l.google.com:19302" }]; // fallback
+    async function loadIceServers() {
+      try {
+        const r = await fetch("/ice", { cache: "no-store" });
+        const d = await r.json();
+        if (Array.isArray(d.iceServers) && d.iceServers.length) {
+          iceServers = d.iceServers;
+          log("Đã tải ICE (Twilio).", "ok");
+        } else {
+          log("Không nhận được danh sách ICE từ /ice. Dùng STUN fallback.", "warn");
+        }
+      } catch (e) {
+        log("Fetch /ice lỗi. Dùng STUN fallback.", "warn");
+      }
+    }
+
     const WS_URL = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host;
     let ws, wsOpen = false;
 
     function setupWS() {
       ws = new WebSocket(WS_URL);
-
       ws.addEventListener("open", () => {
         wsOpen = true;
         $("status").textContent = "WS connected. Sẵn sàng phát.";
         $("btnStart").disabled = false;
         $("btnStartNoAudio").disabled = false;
         log("WebSocket: connected", "ok");
-        listDevicesAndFill(); // sau khi có thể xin quyền
+        listDevicesAndFill();
       });
-
       ws.addEventListener("close", () => {
         wsOpen = false;
         $("status").textContent = "WS disconnected";
@@ -93,24 +106,19 @@
         $("btnFlip").disabled = true;
         log("WebSocket: closed", "warn");
       });
-
       ws.addEventListener("error", () => {
         log("WebSocket error (kiểm tra Render/proxy).", "err");
       });
-
       ws.addEventListener("message", async (ev) => {
         const msg = JSON.parse(ev.data);
-
         if (msg.type === "ack" && msg.role === "broadcaster") {
           log("Server ACK: broadcaster sẵn sàng.", "ok");
           $("status").textContent = "Đang phát… chờ viewer";
         }
-
         if (msg.type === "viewer-join") {
           log(`Viewer join: ${msg.viewerId}`);
           createOfferForViewer(msg.viewerId);
         }
-
         if (msg.type === "answer") {
           const pc = peers.get(msg.viewerId);
           if (pc) {
@@ -118,20 +126,17 @@
             log(`Đã nhận answer từ viewer ${msg.viewerId}`, "ok");
           }
         }
-
         if (msg.type === "ice-candidate") {
           const pc = peers.get(msg.viewerId);
           if (pc && msg.candidate) {
             try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch (e) { log("addIceCandidate error: " + e.message, "err"); }
           }
         }
-
         if (msg.type === "viewer-left") {
           const pc = peers.get(msg.viewerId);
           if (pc) { pc.close(); peers.delete(msg.viewerId); }
           log(`Viewer rời: ${msg.viewerId}`, "warn");
         }
-
         if (msg.type === "end") {
           log("Server yêu cầu dừng phát.", "warn");
           stopStream();
@@ -140,18 +145,11 @@
     }
     setupWS();
 
-    // ========== Media & WebRTC ==========
-    const peers = new Map(); // viewerId -> RTCPeerConnection
+    const peers = new Map();
     let localStream = null;
     let isStreaming = false;
     let desiredFacing = "user";     // user|environment
     let currentCamDeviceId = null;
-
-    const iceServers = [
-      { urls: "stun:stun.l.google.com:19302" },
-      // Thêm TURN nếu cần NAT khó:
-      // { urls: "turn:YOUR_TURN:3478", username:"USER", credential:"PASS" }
-    ];
 
     function makeVideoConstraints({ facing, deviceId }) {
       if (deviceId) return { video: { deviceId: { exact: deviceId } } };
@@ -168,19 +166,15 @@
 
     async function listDevicesAndFill() {
       try {
-        // kích hoạt quyền trước để hiện label
         try {
           const tmp = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
           tmp.getTracks().forEach(t => t.stop());
-        } catch(e) { /* user có thể từ chối lần đầu; vẫn enumerate được 1 phần */ }
-
+        } catch(e) {}
         const devices = await navigator.mediaDevices.enumerateDevices();
         const cams = devices.filter(d => d.kind === "videoinput");
         const mics = devices.filter(d => d.kind === "audioinput");
-
         const selCam = $("selCam"), selMic = $("selMic");
         selCam.innerHTML = ""; selMic.innerHTML = "";
-
         cams.forEach((d, i) => {
           const opt = document.createElement("option");
           opt.value = d.deviceId;
@@ -193,7 +187,6 @@
           opt.textContent = d.label || `Mic ${i+1}`;
           selMic.appendChild(opt);
         });
-
         log(`Thiết bị: ${cams.length} camera, ${mics.length} mic.`, "ok");
       } catch (e) {
         log("enumerateDevices lỗi: " + e.message, "err");
@@ -203,52 +196,34 @@
     async function startStream(withAudio = true) {
       const ok = await ensureWSReady();
       if (!ok) return;
+      await loadIceServers(); // <-- lấy ICE Twilio trước khi tạo peer
 
       const selCam = $("selCam"), selMic = $("selMic");
       const camId = selCam && selCam.value ? selCam.value : undefined;
       const micId = selMic && selMic.value ? selMic.value : undefined;
 
-      const trialConstraints = [];
-      // ưu tiên deviceId nếu đã chọn
+      const trials = [];
       if (camId || (withAudio && micId)) {
-        trialConstraints.push({
-          video: camId ? { deviceId: { exact: camId } } : true,
-          audio: withAudio ? (micId ? { deviceId: { exact: micId } } : true) : false
-        });
+        trials.push({ video: camId ? { deviceId: { exact: camId } } : true, audio: withAudio ? (micId ? { deviceId: { exact: micId } } : true) : false });
       }
-      // facingMode (mobile)
-      trialConstraints.push({
-        video: { facingMode: desiredFacing },
-        audio: withAudio
-      });
-      // 720p mềm
-      trialConstraints.push({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: withAudio
-      });
-      // rất rộng
-      trialConstraints.push({ video: true, audio: withAudio });
-      // video-only fallback
-      trialConstraints.push({ video: true, audio: false });
+      trials.push({ video: { facingMode: desiredFacing }, audio: withAudio });
+      trials.push({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: withAudio });
+      trials.push({ video: true, audio: withAudio });
+      trials.push({ video: true, audio: false });
 
       let stream = null, lastErr = null;
-      for (const c of trialConstraints) {
-        try {
-          log("Thử constraints: " + JSON.stringify(c));
-          stream = await navigator.mediaDevices.getUserMedia(c);
-          if (stream) break;
-        } catch (e) { lastErr = e; }
+      for (const c of trials) {
+        try { log("Thử constraints: " + JSON.stringify(c)); stream = await navigator.mediaDevices.getUserMedia(c); if (stream) break; }
+        catch (e) { lastErr = e; }
       }
       if (!stream) {
         log("Không truy cập được camera/mic: " + (lastErr ? (lastErr.name + ": " + lastErr.message) : ""), "err");
         $("status").textContent = "Không truy cập được camera/mic.";
         return;
       }
-
       localStream = stream;
       $("preview").srcObject = localStream;
 
-      // cập nhật deviceId hiện tại (nếu có)
       const vtrack = localStream.getVideoTracks()[0];
       currentCamDeviceId = vtrack?.getSettings?.().deviceId || camId || null;
 
@@ -260,7 +235,7 @@
       $("btnStartNoAudio").disabled = true;
       $("btnStop").disabled = false;
       $("btnFlip").disabled = false;
-      $("status").textContent = "Đang phát… mời viewer mở viewer.html";
+      $("status").textContent = "Đang phát… chờ viewer";
       log("Đã bắt đầu phát.", "ok");
     }
 
@@ -273,15 +248,11 @@
 
       pc.onicecandidate = (e) => {
         if (e.candidate) {
-          ws.send(JSON.stringify({
-            type: "ice-candidate", from:"broadcaster",
-            viewerId, candidate: e.candidate
-          }));
+          ws.send(JSON.stringify({ type: "ice-candidate", from:"broadcaster", viewerId, candidate: e.candidate }));
         }
       };
-      pc.onconnectionstatechange = () => { /* log(`Peer ${viewerId}: ${pc.connectionState}`); */ };
 
-      const offer = await pc.createOffer(); // KHÔNG truyền offerToReceive*
+      const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       ws.send(JSON.stringify({ type:"offer", viewerId, sdp: pc.localDescription }));
       log(`Đã gửi offer cho viewer ${viewerId}`, "ok");
@@ -328,7 +299,6 @@
         const newTrack = newStream.getVideoTracks()[0];
         if (!newTrack) throw new Error("Không lấy được video track mới.");
 
-        // local preview
         const oldVideoTracks = localStream.getVideoTracks();
         oldVideoTracks.forEach(t => t.stop());
         oldVideoTracks.forEach(t => localStream.removeTrack?.(t));
@@ -336,7 +306,6 @@
         $("preview").srcObject = null;
         $("preview").srcObject = localStream;
 
-        // thay track trên tất cả peer
         for (const [, pc] of peers) {
           const senders = pc.getSenders().filter(s => s.track && s.track.kind === "video");
           if (senders.length) {
@@ -361,10 +330,7 @@
     $("btnStop").onclick  = stopStream;
     $("btnFlip").onclick  = switchCamera;
 
-    document.addEventListener("DOMContentLoaded", () => {
-      // nếu WS đã mở thì liệt kê thiết bị; nếu chưa, listDevicesAndFill sẽ gọi sau khi WS open
-      if (wsOpen) listDevicesAndFill();
-    });
+    document.addEventListener("DOMContentLoaded", () => { /* devices filled after WS open */ });
   </script>
 </body>
 </html>

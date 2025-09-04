@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="vi">
 <head>
@@ -21,17 +22,32 @@
 
   <script>
     const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host);
-    const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+
+    // Load ICE dynamically from /ice (Twilio)
+    let iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+    async function loadIceServers() {
+      try {
+        const r = await fetch("/ice", { cache: "no-store" });
+        const d = await r.json();
+        if (Array.isArray(d.iceServers) && d.iceServers.length) {
+          iceServers = d.iceServers;
+        }
+      } catch (e) {
+        console.warn("Fetch /ice failed, dùng STUN fallback.", e);
+      }
+    }
+
     const $ = id => document.getElementById(id);
 
     let pc = null;
     let viewerId = null;
 
-    function ensurePC() {
+    async function ensurePC() {
       if (pc) return pc;
+      await loadIceServers(); // <-- lấy ICE Twilio
       pc = new RTCPeerConnection({ iceServers });
 
-      // Nhận video & audio chủ động (fix iOS/some browsers chỉ nghe tiếng)
+      // Recvonly transceivers ensure we get video+audio (iOS-safe)
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
 
@@ -55,7 +71,7 @@
       }
 
       if (msg.type === "offer" && msg.viewerId === viewerId) {
-        const pc = ensurePC();
+        const pc = await ensurePC();
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -74,10 +90,10 @@
       }
     });
 
-    $("btnWatch").onclick = () => {
+    $("btnWatch").onclick = async () => {
       ws.send(JSON.stringify({ type: "viewer-join" }));
       $("status").textContent = "Đang kết nối…";
-      ensurePC();
+      await ensurePC();
     };
   </script>
 </body>
