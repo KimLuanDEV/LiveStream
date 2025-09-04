@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Viewer - Livestream</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background:#0b1220; color:#e6f0ff; margin:0; padding:24px; }
+    video { width: 720px; max-width:100%; background:#000; border-radius:12px; }
+    .tag { background:#17203a; padding:6px 10px; border-radius:8px; font-size:12px; display:inline-block; }
+    button { padding:10px 16px; border:0; border-radius:10px; cursor:pointer; font-weight:600; background:#3498db; }
+  </style>
+</head>
+<body>
+  <h1>👀 Viewer</h1>
+  <p class="tag" id="status">Chưa kết nối</p>
+  <div style="margin:12px 0;">
+    <button id="btnWatch">Xem livestream</button>
+  </div>
+  <video id="player" playsinline autoplay controls></video>
+
+  <script>
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host);
+    const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+    const $ = id => document.getElementById(id);
+
+    let pc = null;
+    let viewerId = null;
+
+    ws.addEventListener("open", () => {
+      $("status").textContent = "WS connected. Nhấn 'Xem livestream'.";
+    });
+
+    ws.addEventListener("message", async (ev) => {
+      const msg = JSON.parse(ev.data);
+
+      if (msg.type === "ack" && msg.role === "viewer") {
+        viewerId = msg.viewerId;
+        $("status").textContent = "Đang chờ broadcaster…";
+      }
+
+      if (msg.type === "offer" && msg.viewerId === viewerId) {
+        // tạo pc nếu chưa
+        if (!pc) {
+          pc = new RTCPeerConnection({ iceServers });
+          pc.ontrack = (e) => {
+            $("player").srcObject = e.streams[0];
+          };
+          pc.onicecandidate = (e) => {
+            if (e.candidate) {
+              ws.send(JSON.stringify({
+                type: "ice-candidate",
+                from: "viewer",
+                viewerId,
+                candidate: e.candidate
+              }));
+            }
+          };
+        }
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: "answer", viewerId, sdp: pc.localDescription }));
+        $("status").textContent = "Đang xem…";
+      }
+
+      if (msg.type === "ice-candidate" && msg.viewerId === viewerId && msg.candidate) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch {}
+      }
+
+      if (msg.type === "end") {
+        $("status").textContent = "Broadcaster đã dừng.";
+        if (pc) { pc.close(); pc = null; }
+        $("player").srcObject = null;
+      }
+    });
+
+    $("btnWatch").onclick = () => {
+      ws.send(JSON.stringify({ type: "viewer-join" }));
+      $("status").textContent = "Đang kết nối…";
+    };
+  </script>
+</body>
+</html>

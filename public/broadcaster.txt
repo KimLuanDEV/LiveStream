@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Broadcaster - Livestream</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: system-ui, Segoe UI, Roboto, sans-serif; background:#0b1220; color:#e6f0ff; margin:0; padding:24px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    video { width: 640px; max-width:100%; background:#000; border-radius:12px; }
+    button { padding:10px 16px; border:0; border-radius:10px; cursor:pointer; font-weight:600; }
+    .start { background:#2ecc71; }
+    .stop { background:#e74c3c; }
+    .muted { background:#8e44ad; }
+    .tag { background:#17203a; padding:6px 10px; border-radius:8px; font-size:12px; }
+    #logs { background:#0e1730; border:1px solid #233056; border-radius:10px; padding:10px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; max-height:200px; overflow:auto; }
+    .warn { color:#f7d774 }
+    .err { color:#ff8a8a }
+    .ok { color:#8ff0a4 }
+  </style>
+</head>
+<body>
+  <h1>🎥 Broadcaster</h1>
+
+  <div class="row">
+    <button id="btnStart" class="start" disabled>Bắt đầu phát</button>
+    <button id="btnStartNoAudio" class="muted" disabled>Phát (không mic)</button>
+    <button id="btnStop" class="stop" disabled>Dừng phát</button>
+    <span id="status" class="tag">Đang khởi tạo…</span>
+  </div>
+
+  <p>
+    <span id="secureHint" class="tag"></span>
+  </p>
+
+  <video id="preview" playsinline autoplay muted></video>
+
+  <h3>Nhật ký</h3>
+  <div id="logs"></div>
+
+  <script>
+    // ====== Helpers ======
+    const $ = (id) => document.getElementById(id);
+    function log(msg, cls="") {
+      const d = new Date().toLocaleTimeString();
+      const el = document.createElement("div");
+      if (cls) el.className = cls;
+      el.textContent = `[${d}] ${msg}`;
+      $("logs").appendChild(el);
+      $("logs").scrollTop = $("logs").scrollHeight;
+      console.log(msg);
+    }
+
+    // ====== Secure context hint (HTTPS/localhost) ======
+    const isSecure = location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    $("secureHint").textContent = isSecure
+      ? "✅ Secure context OK (HTTPS/localhost)"
+      : "⚠️ Cần chạy HTTPS hoặc localhost để camera/mic hoạt động";
+
+    // ====== WS setup ======
+    const WS_URL = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host;
+    let ws;
+    let wsOpen = false;
+
+    function setupWS() {
+      ws = new WebSocket(WS_URL);
+
+      ws.addEventListener("open", () => {
+        wsOpen = true;
+        $("status").textContent = "WS connected. Sẵn sàng phát.";
+        $("btnStart").disabled = false;
+        $("btnStartNoAudio").disabled = false;
+        log("WebSocket: connected", "ok");
+      });
+
+      ws.addEventListener("close", (e) => {
+        wsOpen = false;
+        $("status").textContent = "WS disconnected";
+        $("btnStart").disabled = true;
+        $("btnStartNoAudio").disabled = true;
+        log("WebSocket: closed", "warn");
+      });
+
+      ws.addEventListener("error", (e) => {
+        log("WebSocket error (kiểm tra cổng/Render/Vercel hỗ trợ WS).", "err");
+      });
+
+      ws.addEventListener("message", async (ev) => {
+        const msg = JSON.parse(ev.data);
+
+        if (msg.type === "ack" && msg.role === "broadcaster") {
+          log("Server ACK: broadcaster sẵn sàng.", "ok");
+          $("status").textContent = "Đang phát… chờ viewer";
+        }
+
+        if (msg.type === "viewer-join") {
+          log(`Viewer join: ${msg.viewerId}`);
+          createOfferForViewer(msg.viewerId);
+        }
+
+        if (msg.type === "answer") {
+          const pc = peers.get(msg.viewerId);
+          if (pc) {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            log(`Đã nhận answer từ viewer ${msg.viewerId}`, "ok");
+          }
+        }
+
+        if (msg.type === "ice-candidate") {
+          const pc = peers.get(msg.viewerId);
+          if (pc && msg.candidate) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch (e) { log("addIceCandidate error: " + e.message, "err"); }
+          }
+        }
+
+        if (msg.type === "viewer-left") {
+          const pc = peers.get(msg.viewerId);
+          if (pc) {
+            pc.close();
+            peers.delete(msg.viewerId);
+            log(`Viewer rời: ${msg.viewerId}`, "warn");
+          }
+        }
+
+        if (msg.type === "end") {
+          log("Server yêu cầu dừng phát (broadcaster cũ ngắt).", "warn");
+          stopStream();
+        }
+      });
+    }
+
+    // Gọi ngay
+    setupWS();
+
+    // ====== WebRTC ======
+    const peers = new Map(); // viewerId -> RTCPeerConnection
+    let localStream = null;
+    let isStreaming = false;
+    const iceServers = [
+      { urls: "stun:stun.l.google.com:19302" },
+      // Nếu cần xuyên NAT tốt hơn, thêm TURN ở đây:
+      // { urls: "turn:your.turn.server:3478", username: "user", credential: "pass" }
+    ];
+
+    async function ensureWSReady() {
+      if (wsOpen) return true;
+      for (let i=0;i<30;i++) { // đợi tối đa ~3s
+        await new Promise(r => setTimeout(r, 100));
+        if (wsOpen) return true;
+      }
+      log("WS chưa sẵn sàng. Không thể phát.", "err");
+      return false;
+    }
+
+    async function startStream(withAudio = true) {
+      // 1) Kiểm tra WS
+      const ok = await ensureWSReady();
+      if (!ok) return;
+
+      // 2) Xin thiết bị
+      try {
+        const constraints = { video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: withAudio };
+        localStream = await navigator.mediaDevices.getUserMedia(constraints);
+        $("preview").srcObject = localStream;
+        log("Đã lấy camera/mic.", "ok");
+      } catch (e) {
+        log("Không truy cập được camera/mic: " + e.message, "err");
+        $("status").textContent = "Từ chối camera/mic hoặc lỗi thiết bị.";
+        return;
+      }
+
+      // 3) Báo server: broadcaster sẵn sàng
+      try {
+        ws.send(JSON.stringify({ type: "broadcaster-ready" }));
+      } catch (e) {
+        log("Gửi broadcaster-ready thất bại: " + e.message, "err");
+        return;
+      }
+
+      isStreaming = true;
+      $("btnStart").disabled = true;
+      $("btnStartNoAudio").disabled = true;
+      $("btnStop").disabled = false;
+      $("status").textContent = "Đang phát… mời viewer mở viewer.html";
+    }
+
+    async function createOfferForViewer(viewerId) {
+      if (!localStream) {
+        log("Chưa có localStream khi viewer join.", "err");
+        return;
+      }
+      const pc = new RTCPeerConnection({ iceServers });
+      peers.set(viewerId, pc);
+
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          ws.send(JSON.stringify({
+            type: "ice-candidate",
+            from: "broadcaster",
+            viewerId,
+            candidate: e.candidate
+          }));
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        log(`Peer ${viewerId} state: ${pc.connectionState}`);
+      };
+
+      const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
+      await pc.setLocalDescription(offer);
+
+      ws.send(JSON.stringify({
+        type: "offer",
+        viewerId,
+        sdp: pc.localDescription
+      }));
+      log(`Đã gửi offer cho viewer ${viewerId}`, "ok");
+    }
+
+    function stopStream() {
+      if (!isStreaming) return;
+      for (const [, pc] of peers) pc.close();
+      peers.clear();
+      if (localStream) localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+      isStreaming = false;
+      $("preview").srcObject = null;
+      $("btnStart").disabled = !wsOpen ? true : false;
+      $("btnStartNoAudio").disabled = !wsOpen ? true : false;
+      $("btnStop").disabled = true;
+      $("status").textContent = "Đã dừng phát";
+      log("Đã dừng phát và đóng mọi peer.");
+    }
+
+    $("btnStart").onclick = () => startStream(true);
+    $("btnStartNoAudio").onclick = () => startStream(false);
+    $("btnStop").onclick = stopStream;
+
+    // ====== Extra: kiểm tra thiết bị sẵn có (gợi ý debug) ======
+    (async () => {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === "videoinput").length;
+        const mics = devices.filter(d => d.kind === "audioinput").length;
+        log(`Thiết bị: ${cams} camera, ${mics} mic.`);
+      } catch {}
+    })();
+  </script>
+</body>
+</html>
