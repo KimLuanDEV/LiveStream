@@ -1,4 +1,3 @@
-
 <!doctype html>
 <html lang="vi">
 <head>
@@ -10,6 +9,7 @@
     video { width: 720px; max-width:100%; background:#000; border-radius:12px; }
     .tag { background:#17203a; padding:6px 10px; border-radius:8px; font-size:12px; display:inline-block; }
     button { padding:10px 16px; border:0; border-radius:10px; cursor:pointer; font-weight:600; background:#3498db; }
+    input[type="checkbox"] { transform: scale(1.1); margin-right: 6px; }
   </style>
 </head>
 <body>
@@ -17,13 +17,16 @@
   <p class="tag" id="status">Chưa kết nối</p>
   <div style="margin:12px 0;">
     <button id="btnWatch">Xem livestream</button>
+    <label class="tag" style="cursor:pointer">
+      <input type="checkbox" id="chkRelayOnly"> TURN-only (chẩn đoán)
+    </label>
   </div>
   <video id="player" playsinline autoplay controls></video>
 
   <script>
     const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host);
 
-    // Load ICE dynamically from /ice (Twilio)
+    // Load ICE dynamically from /ice (Twilio) + ưu tiên 443
     let iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
     async function loadIceServers() {
       try {
@@ -31,6 +34,30 @@
         const d = await r.json();
         if (Array.isArray(d.iceServers) && d.iceServers.length) {
           iceServers = d.iceServers;
+
+  // ---- ƯU TIÊN TLS/443 cho mạng di động (5G) ----
+  const anyTurn = iceServers.find(s => String(s.urls||s.url||'').includes('turn'));
+  const has443 = iceServers.some(s => String(s.urls||s.url||'').includes(':443'));
+  if (anyTurn && !has443) {
+    iceServers.push({
+      urls: "turns:global.turn.twilio.com:443?transport=tcp",
+      username: anyTurn.username,
+      credential: anyTurn.credential
+    });
+  }
+  const score = u =>
+    u.includes('turns:') && u.includes(':443') ? 0 :
+    u.includes('turns:') && u.includes(':5349') ? 1 :
+    u.includes('turn:')  && u.includes('transport=tcp') ? 2 :
+    u.includes('turn:')  ? 3 :
+    u.includes('stun:')  ? 4 : 5;
+  iceServers = iceServers
+    .flatMap(s => {
+      const urls = Array.isArray(s.urls) ? s.urls : [s.urls || s.url].filter(Boolean);
+      return urls.map(url => ({ urls: url, username: s.username, credential: s.credential }));
+    })
+    .sort((a,b) => score(String(a.urls)) - score(String(b.urls)));
+
         }
       } catch (e) {
         console.warn("Fetch /ice failed, dùng STUN fallback.", e);
@@ -44,8 +71,22 @@
 
     async function ensurePC() {
       if (pc) return pc;
-      await loadIceServers(); // <-- lấy ICE Twilio
-      pc = new RTCPeerConnection({ iceServers });
+      await loadIceServers();
+      const userRelayOnly = document.getElementById("chkRelayOnly")?.checked;
+      const isCellular = navigator.connection && /cellular/i.test(navigator.connection.type || navigator.connection.effectiveType || "");
+      const forceRelay = userRelayOnly || isCellular; // auto relay trên mạng di động
+
+      pc = new RTCPeerConnection({
+        iceServers,
+        iceTransportPolicy: forceRelay ? "relay" : "all"
+      });
+
+      pc.oniceconnectionstatechange = () => {
+        console.log("ICE state:", pc.iceConnectionState);
+        if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+          setTimeout(logSelectedCandidatePair, 1500);
+        }
+      };
 
       // Recvonly transceivers ensure we get video+audio (iOS-safe)
       pc.addTransceiver('video', { direction: 'recvonly' });
@@ -53,21 +94,36 @@
 
       pc.ontrack = (e) => {
         const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
-        $("player").srcObject = stream;
-        $("player").play().catch(()=>{});
+        $("#player").srcObject = stream;
+        $("#player").play().catch(()=>{});
       };
 
       return pc;
     }
 
-    ws.addEventListener("open", () => { $("status").textContent = "WS connected. Nhấn 'Xem livestream'."; });
+    async function logSelectedCandidatePair() {
+      try {
+        const stats = await pc.getStats();
+        stats.forEach(report => {
+          if (report.type === "transport" && report.selectedCandidatePairId) {
+            const pair = stats.get(report.selectedCandidatePairId);
+            const local = stats.get(pair.localCandidateId);
+            const remote = stats.get(pair.remoteCandidateId);
+            console.log("Selected pair -> local:", local.candidateType, local.protocol, (local.ip||local.address)+":"+local.port);
+            console.log("Selected pair -> remote:", remote.candidateType, remote.protocol, (remote.ip||remote.address)+":"+remote.port);
+          }
+        });
+      } catch {}
+    }
+
+    ws.addEventListener("open", () => { $("#status").textContent = "WS connected. Nhấn 'Xem livestream'."; });
 
     ws.addEventListener("message", async (ev) => {
       const msg = JSON.parse(ev.data);
 
       if (msg.type === "ack" && msg.role === "viewer") {
         viewerId = msg.viewerId;
-        $("status").textContent = "Đang chờ broadcaster…";
+        $("#status").textContent = "Đang chờ broadcaster…";
       }
 
       if (msg.type === "offer" && msg.viewerId === viewerId) {
@@ -76,7 +132,7 @@
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         ws.send(JSON.stringify({ type: "answer", viewerId, sdp: pc.localDescription }));
-        $("status").textContent = "Đang xem…";
+        $("#status").textContent = "Đang xem…";
       }
 
       if (msg.type === "ice-candidate" && msg.viewerId === viewerId && msg.candidate) {
@@ -84,15 +140,15 @@
       }
 
       if (msg.type === "end") {
-        $("status").textContent = "Broadcaster đã dừng.";
+        $("#status").textContent = "Broadcaster đã dừng.";
         if (pc) { pc.close(); pc = null; }
-        $("player").srcObject = null;
+        $("#player").srcObject = null;
       }
     });
 
-    $("btnWatch").onclick = async () => {
+    $("#btnWatch").onclick = async () => {
       ws.send(JSON.stringify({ type: "viewer-join" }));
-      $("status").textContent = "Đang kết nối…";
+      $("#status").textContent = "Đang kết nối…";
       await ensurePC();
     };
   </script>

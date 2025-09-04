@@ -1,4 +1,4 @@
-// server.js (Twilio ICE dynamic)
+// server.js (Twilio ICE dynamic + WS signaling)
 import express from "express";
 import http from "http";
 import { WebSocketServer } from "ws";
@@ -9,7 +9,7 @@ const app = express();
 app.use(express.static("public"));
 const server = http.createServer(app);
 
-// Render/proxy friendly timeouts
+// Proxy-friendly timeouts
 server.keepAliveTimeout = 65000;
 server.headersTimeout   = 66000;
 
@@ -31,8 +31,8 @@ app.get("/ice", async (req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-let broadcaster = null;           // socket of broadcaster
-const viewers = new Map();        // viewerId -> socket
+let broadcaster = null;
+const viewers = new Map();
 
 function send(ws, msg) {
   try {
@@ -40,7 +40,6 @@ function send(ws, msg) {
   } catch {}
 }
 
-// Heartbeat keep-alive
 function heartbeat() { this.isAlive = true; }
 wss.on("connection", (ws) => {
   ws.id = uuidv4();
